@@ -233,6 +233,16 @@
     line-height: var(--line-height-normal);
 }
 
+/* Per-line "changed since your last visit" overlay in the editor. The
+   colored left border + subtle tint is colored per-author via the
+   --edit-history-blame-color custom property set inline on each line. Using
+   box-shadow instead of border-left avoids shifting the text position. */
+.cm-line.edit-history-blame-line {
+    box-shadow: inset 3px 0 0 0 var(--edit-history-blame-color, var(--interactive-accent));
+    background-color: color-mix(in srgb, var(--edit-history-blame-color, var(--interactive-accent)) 10%, transparent);
+    transition: box-shadow 0.3s ease, background-color 0.3s ease;
+}
+
 /* Small clock badge next to files that have a sibling .edtz history */
 .edit-history-file-badge {
     display: inline-flex;

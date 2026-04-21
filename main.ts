@@ -3,7 +3,9 @@ import {
     ButtonComponent,
     Component,
     DropdownComponent,
+    Editor,
     MarkdownRenderer,
+    MarkdownView,
     Modal,
     normalizePath,
     Notice,
@@ -16,6 +18,8 @@ import {
     TFolder,
     ToggleComponent
 } from "obsidian";
+import { StateEffect, StateField } from "@codemirror/state";
+import { Decoration, DecorationSet, EditorView } from "@codemirror/view";
 import { DiffMatchPatch, Diff } from "diff-match-patch-ts";
 // diff-match-patch-ts doesn't export properly module enums, it uses a const
 // enum (instead of a non const enum) which is removed at compile time and not
@@ -158,6 +162,123 @@ const EDIT_AUTHOR_DELIM = "@";
 const AUTHOR_OVERRIDE_FILE = "current-author";
 
 const EDIT_HISTORY_FILE_EXT = ".edtz";
+
+// --- Device-local "seen changes" state ---------------------------------------
+// We track "last time you viewed this file on THIS device" in localStorage so
+// that opening a note shows changes since your previous visit. localStorage is
+// per-Electron-install = per-device; even if the vault is synced, each machine
+// has its own bookmark. Keys are prefixed to avoid collisions with other
+// plugins / with Obsidian internals.
+const LAST_VIEWED_LS_PREFIX = "edit-history:last-viewed:";
+
+function getLastViewed(filePath: string): number | null {
+    try {
+        const raw = localStorage.getItem(LAST_VIEWED_LS_PREFIX + filePath);
+        if (!raw) return null;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : null;
+    } catch {
+        return null;
+    }
+}
+function setLastViewed(filePath: string, epoch: number) {
+    try {
+        localStorage.setItem(LAST_VIEWED_LS_PREFIX + filePath, String(epoch));
+    } catch {
+        // localStorage quota / disabled — ignore, we just lose the bookmark.
+    }
+}
+
+// --- Author → color ----------------------------------------------------------
+// Deterministic hash-to-hue so the same author always gets the same color, and
+// different authors spread around the color wheel without needing a configured
+// palette.
+function hashStringToHue(s: string): number {
+    let hash = 0;
+    for (let i = 0; i < s.length; i++) {
+        hash = ((hash << 5) - hash) + s.charCodeAt(i);
+        hash |= 0;
+    }
+    return Math.abs(hash) % 360;
+}
+function getAuthorColor(author: string): string {
+    return `hsl(${hashStringToHue(author)}, 65%, 50%)`;
+}
+
+// Minimum line length (after trimming) for a line to be considered for blame
+// matching. Blank lines and single-char markers like "---" or "|" would match
+// too often and swamp the output with noise.
+const BLAME_MIN_LINE_LEN = 3;
+
+// --- CM6 integration ---------------------------------------------------------
+// A StateField per editor view holds the current set of per-line "changed
+// since your last visit" decorations. Two effects act on it:
+//  - replaceBlameDecorationsEffect: overwrite the whole set (dispatched by the
+//    plugin after it's recomputed blame for the file).
+//  - clearAllBlameEffect: drop everything (used by the "Mark as read" command).
+// Additionally, any doc-change in a transaction automatically clears
+// decorations on the touched lines — that's the "fade once you've edited the
+// changed region" behavior baked into the field itself, no plugin round-trip
+// required.
+interface BlameLineSpec {
+    line: number;      // 1-based line number
+    author: string;
+    color: string;
+}
+
+const replaceBlameDecorationsEffect = StateEffect.define<DecorationSet>();
+const clearAllBlameEffect = StateEffect.define<null>();
+
+function buildBlameDecorations(view: EditorView, specs: BlameLineSpec[]): DecorationSet {
+    const doc = view.state.doc;
+    const items: { from: number; spec: BlameLineSpec }[] = [];
+    for (const s of specs) {
+        if (s.line < 1 || s.line > doc.lines) continue;
+        items.push({ from: doc.line(s.line).from, spec: s });
+    }
+    items.sort((a, b) => a.from - b.from);
+    const decos = items.map(b =>
+        Decoration.line({
+            attributes: {
+                style: `--edit-history-blame-color: ${b.spec.color};`,
+                title: `Changed since your last visit — ${b.spec.author}`
+            },
+            class: "edit-history-blame-line"
+        }).range(b.from)
+    );
+    return Decoration.set(decos, true);
+}
+
+const blameField = StateField.define<DecorationSet>({
+    create() {
+        return Decoration.none;
+    },
+    update(decos, tr) {
+        decos = decos.map(tr.changes);
+        for (const e of tr.effects) {
+            if (e.is(replaceBlameDecorationsEffect)) decos = e.value;
+            if (e.is(clearAllBlameEffect)) decos = Decoration.none;
+        }
+        if (tr.docChanged) {
+            const touched = new Set<number>();
+            tr.changes.iterChanges((_fromA, _toA, fromB, toB) => {
+                const doc = tr.state.doc;
+                let pos = fromB;
+                while (pos <= toB) {
+                    const line = doc.lineAt(pos);
+                    touched.add(line.from);
+                    if (line.to >= doc.length) break;
+                    pos = line.to + 1;
+                }
+            });
+            if (touched.size > 0) {
+                decos = decos.update({ filter: (from) => !touched.has(from) });
+            }
+        }
+        return decos;
+    },
+    provide: f => EditorView.decorations.from(f)
+});
 
 // XXX Use Github actions to release plugin 
 //     See https://docs.obsidian.md/Plugins/Releasing/Release+your+plugin+with+GitHub+Actions
@@ -958,8 +1079,173 @@ export default class EditHistory extends Plugin {
         this.registerEvent(this.app.vault.on("delete", refreshFileExplorer));
         this.registerEvent(this.app.vault.on("rename", refreshFileExplorer));
 
+        // "Changes since your last visit" blame overlay in the editor.
+        this.registerEditorExtension([blameField]);
+        this.registerEvent(this.app.workspace.on("file-open", (file) => {
+            if (file) this.applyBlameToFile(file);
+        }));
+        this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
+            // When the user leaves a MarkdownView, bump its lastViewed bookmark
+            // so that next time they open it, blame reflects changes made
+            // while they were away. We do this here (on leave) rather than on
+            // open so the user still sees highlights during the session.
+            if (!leaf) return;
+            const prev = this.lastActiveFilePath;
+            const currentFile = (leaf.view instanceof MarkdownView) ? leaf.view.file?.path : undefined;
+            if (prev && prev !== currentFile) {
+                setLastViewed(prev, Date.now());
+            }
+            this.lastActiveFilePath = currentFile ?? null;
+        }));
+
+        this.addCommand({
+            id: "mark-file-as-read",
+            name: "Mark current file as read (clear change highlights)",
+            checkCallback: (checking: boolean) => {
+                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                if (!view?.file) return false;
+                if (!checking) {
+                    setLastViewed(view.file.path, Date.now());
+                    const cm = (view.editor as unknown as { cm?: EditorView }).cm;
+                    cm?.dispatch({ effects: clearAllBlameEffect.of(null) });
+                    new Notice("Edit History: change highlights cleared");
+                }
+                return true;
+            }
+        });
+
 
         this.addSettingTab(new EditHistorySettingTab(this.app, this));
+    }
+
+    lastActiveFilePath: string | null = null;
+
+    /**
+     * For each line in `file`'s current content, attribute it to the author
+     * of the most recent edit (newer than lastViewed) that introduced a line
+     * with matching text. Blank/very short lines are filtered out.
+     *
+     * MVP blame: matches by line TEXT, not by tracking positions through
+     * patches. Limitation: if two different edits added identical lines, the
+     * more recent author wins. Good enough for markdown notes where duplicate
+     * non-trivial lines are rare.
+     */
+    async computeBlameForFile(file: TFile): Promise<BlameLineSpec[]> {
+        if (!this.keepEditHistoryForFile(file)) return [];
+
+        const lastViewed = getLastViewed(file.path);
+        if (lastViewed === null) {
+            // First time we've seen this file on this device — establish the
+            // baseline and show no highlights. Subsequent visits will show
+            // changes made after this moment.
+            setLastViewed(file.path, Date.now());
+            return [];
+        }
+
+        const zipFilepath = this.getEditHistoryFilepath(file.path);
+        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+        if (!(zipFile instanceof TFile)) return [];
+
+        const zipData = await this.app.vault.readBinary(zipFile);
+        if (!zipData) return [];
+
+        const zip = new JSZip();
+        await zip.loadAsync(zipData);
+        const filepaths: string[] = [];
+        zip.forEach((rel: string) => filepaths.push(rel));
+        if (filepaths.length === 0) return [];
+        this.sortEdits(filepaths);
+
+        const dmp = new DiffMatchPatch();
+
+        // Reconstruct historical states newest-first. states[i] = file content
+        // after the edit at filepaths[i] (i.e., the content that user saved).
+        let data = await this.app.vault.read(file);
+        const states: string[] = [];
+        for (const fp of filepaths) {
+            const raw = await zip.file(fp).async("string");
+            if (this.getEditIsDiff(fp)) {
+                const patches = dmp.patch_fromText(raw);
+                data = dmp.patch_apply(patches, data)[0];
+            } else {
+                data = raw;
+            }
+            states.push(data);
+        }
+
+        // Collect (added line text → most recent author) across edits whose
+        // epoch is after lastViewed. Skip edits authored by the current user
+        // since highlighting your own changes is noise.
+        const currentAuthor = await this.getCurrentAuthor();
+        const addedLines = new Map<string, { author: string; epoch: number }>();
+        for (let i = 0; i < filepaths.length; i++) {
+            const fp = filepaths[i];
+            const epoch = this.getEditEpoch(fp);
+            if (epoch <= lastViewed) break;  // edits are sorted newest-first
+            const author = this.getEditAuthor(fp) ?? "unknown";
+            if (author === currentAuthor) continue;
+
+            const newer = states[i];
+            const older = (i + 1 < states.length) ? states[i + 1] : "";
+            // Line-mode diff keeps memory bounded for large files and is
+            // exactly what we want for per-line blame.
+            const lineDiff = (dmp as any).diff_linesToChars_(older, newer);
+            const charDiffs = dmp.diff_main(lineDiff.chars1, lineDiff.chars2, false);
+            (dmp as any).diff_charsToLines_(charDiffs, lineDiff.lineArray);
+
+            for (const [op, segment] of charDiffs) {
+                if ((op as number) !== DiffOp.Insert) continue;
+                for (const line of segment.split("\n")) {
+                    if (line.trim().length < BLAME_MIN_LINE_LEN) continue;
+                    const existing = addedLines.get(line);
+                    if (!existing || existing.epoch < epoch) {
+                        addedLines.set(line, { author, epoch });
+                    }
+                }
+            }
+        }
+
+        if (addedLines.size === 0) return [];
+
+        const currentContent = await this.app.vault.read(file);
+        const currentLines = currentContent.split("\n");
+        const blame: BlameLineSpec[] = [];
+        for (let i = 0; i < currentLines.length; i++) {
+            const line = currentLines[i];
+            if (line.trim().length < BLAME_MIN_LINE_LEN) continue;
+            const match = addedLines.get(line);
+            if (!match) continue;
+            blame.push({
+                line: i + 1,
+                author: match.author,
+                color: getAuthorColor(match.author)
+            });
+        }
+        return blame;
+    }
+
+    async applyBlameToFile(file: TFile): Promise<void> {
+        let specs: BlameLineSpec[];
+        try {
+            specs = await this.computeBlameForFile(file);
+        } catch (e) {
+            logWarn("Failed to compute blame", e);
+            specs = [];
+        }
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (!(leaf.view instanceof MarkdownView)) return;
+            if (leaf.view.file?.path !== file.path) return;
+            const cm = (leaf.view.editor as unknown as { cm?: EditorView }).cm;
+            if (!cm) return;
+            if (!cm.state.field(blameField, false)) {
+                // The editor extension isn't active on this view yet (this
+                // happens for already-open leaves when the plugin just
+                // loaded). Skip; next file-open will catch it.
+                return;
+            }
+            const decorations = buildBlameDecorations(cm, specs);
+            cm.dispatch({ effects: replaceBlameDecorationsEffect.of(decorations) });
+        });
     }
 
     onunload() {
