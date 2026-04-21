@@ -6,15 +6,11 @@ import path from "path";
 
 function copyArtifactsToDirectory(artifacts, dirpath) {
     console.log("Copying artifacts to dirpath", dirpath);
-    try {
-        //console.debug("Creating dir", dirpath);
-        fs.mkdirSync(dirpath).catch(() => null);
-    } catch {
-    }
+    fs.mkdirSync(dirpath, { recursive: true });
     for (let artifact of artifacts) {
         const outFilepath = path.join(dirpath, artifact);
         //console.debug("copying", artifact, "to", outFilepath);
-        fs.copyFileSync(artifact, outFilepath);	
+        fs.copyFileSync(artifact, outFilepath);
     }
 }
 

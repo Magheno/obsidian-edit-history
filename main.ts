@@ -801,10 +801,27 @@ export default class EditHistory extends Plugin {
                         this.app.vault.trigger("modify", this.app.workspace.getActiveFile(), true);
                     }
                     return true;
-                } 
+                }
                 return false;
             }
         });
+
+        this.registerEvent(
+            this.app.workspace.on("file-menu", (menu, file) => {
+                if (!(file instanceof TFile)) return;
+                if (!this.keepEditHistoryForFile(file)) return;
+                menu.addItem((item) => {
+                    item
+                        .setTitle("Show edit history")
+                        .setIcon("clock")
+                        .onClick(async () => {
+                            const leaf = this.app.workspace.getLeaf(false);
+                            await leaf.openFile(file);
+                            new EditHistoryModal(this).open();
+                        });
+                });
+            })
+        );
 
 
         this.addSettingTab(new EditHistorySettingTab(this.app, this));
