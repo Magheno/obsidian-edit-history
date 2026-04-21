@@ -466,6 +466,88 @@ export default class EditHistory extends Plugin {
         return { moved, skipped, errors };
     }
 
+    /**
+     * Build a Set of note paths (no .edtz extension, no mirrored-root prefix)
+     * that currently have a stored edit history. This is the single source of
+     * truth for the file-explorer badge and is layout-agnostic.
+     *
+     * Why not just vault.getAbstractFileByPath per note? Because in mirrored
+     * storage mode the history files live inside a dotfile folder (`.edtz/`),
+     * which Obsidian's vault tree may not track — the vault API happily
+     * returns null for paths inside `.`-prefixed folders on many versions.
+     * Falling back to the low-level adapter.list() reads the actual
+     * filesystem and always sees the files.
+     */
+    async getNotesWithHistorySet(): Promise<Set<string>> {
+        const result = new Set<string>();
+
+        for (const f of this.app.vault.getFiles()) {
+            const notePath = this.edtzToNotePath(f.path);
+            if (notePath) result.add(notePath);
+        }
+
+        // When mirrored storage is active, the authoritative listing comes
+        // from the filesystem adapter, not the vault tree.
+        if (this.editHistoryRootFolder) {
+            try {
+                await this.walkAdapterForEdtzFiles(this.editHistoryRootFolder, result);
+            } catch (e) {
+                logWarn("Adapter walk for edit-history files failed", e);
+            }
+        }
+        return result;
+    }
+
+    async walkAdapterForEdtzFiles(folder: string, acc: Set<string>): Promise<void> {
+        const adapter = this.app.vault.adapter;
+        if (!(await adapter.exists(folder))) return;
+        const listing = await adapter.list(folder);
+        for (const file of listing.files) {
+            const notePath = this.edtzToNotePath(file);
+            if (notePath) acc.add(notePath);
+        }
+        for (const sub of listing.folders) {
+            await this.walkAdapterForEdtzFiles(sub, acc);
+        }
+    }
+
+    /**
+     * Walk all visible file-explorer items, hide .edtz rows, and add/remove
+     * the clock badge on notes that have a stored history file.
+     */
+    async refreshFileExplorer(): Promise<void> {
+        const notesWithHistory = await this.getNotesWithHistorySet();
+        const leaves = this.app.workspace.getLeavesOfType("file-explorer");
+        for (const leaf of leaves) {
+            const view = leaf.view as unknown as {
+                fileItems?: Record<string, { el?: HTMLElement; selfEl?: HTMLElement; titleEl?: HTMLElement }>
+            };
+            const fileItems = view?.fileItems;
+            if (!fileItems) continue;
+            for (const p in fileItems) {
+                const item = fileItems[p];
+                const titleEl = item.selfEl ?? item.titleEl;
+                const rowEl = item.el ?? titleEl?.parentElement ?? undefined;
+                if (!titleEl || !rowEl) continue;
+
+                if (p.toLowerCase().endsWith(EDIT_HISTORY_FILE_EXT)) {
+                    rowEl.addClass("edit-history-hidden-file");
+                    continue;
+                }
+
+                const hasHistory = notesWithHistory.has(p);
+                const existing = titleEl.querySelector(".edit-history-file-badge");
+                if (hasHistory && !existing) {
+                    const badge = titleEl.createEl("span", { cls: "edit-history-file-badge" });
+                    setIcon(badge, "clock");
+                    badge.setAttribute("aria-label", "Has edit history");
+                } else if (!hasHistory && existing) {
+                    existing.remove();
+                }
+            }
+        }
+    }
+
     /** Recursively delete any folder under `folder` (and folder itself) that
      *  has no descendants left. Used after a mirrored→sibling migration to
      *  tidy up the empty `.edtz/...` shadow tree. */
@@ -1174,43 +1256,18 @@ export default class EditHistory extends Plugin {
         );
 
         // Decorate the file explorer: hide *.edtz rows, mark files that have a
-        // sibling *.edtz with a small clock badge.
-        const refreshFileExplorer = () => {
-            const leaves = this.app.workspace.getLeavesOfType("file-explorer");
-            for (const leaf of leaves) {
-                const view = leaf.view as unknown as { fileItems?: Record<string, { el?: HTMLElement; selfEl?: HTMLElement; titleEl?: HTMLElement }> };
-                const fileItems = view?.fileItems;
-                if (!fileItems) continue;
-                for (const p in fileItems) {
-                    const item = fileItems[p];
-                    const titleEl = item.selfEl ?? item.titleEl;
-                    const rowEl = item.el ?? titleEl?.parentElement ?? undefined;
-                    if (!titleEl || !rowEl) continue;
-
-                    if (p.toLowerCase().endsWith(EDIT_HISTORY_FILE_EXT)) {
-                        rowEl.addClass("edit-history-hidden-file");
-                        continue;
-                    }
-
-                    const hasHistory = this.app.vault.getAbstractFileByPath(this.getEditHistoryFilepath(p)) != null;
-                    const existing = titleEl.querySelector(".edit-history-file-badge");
-                    if (hasHistory && !existing) {
-                        const badge = titleEl.createEl("span", { cls: "edit-history-file-badge" });
-                        setIcon(badge, "clock");
-                        badge.setAttribute("aria-label", "Has edit history");
-                    } else if (!hasHistory && existing) {
-                        existing.remove();
-                    }
-                }
-            }
-        };
-
-        this.app.workspace.onLayoutReady(refreshFileExplorer);
-        this.registerEvent(this.app.workspace.on("layout-change", refreshFileExplorer));
-        this.registerEvent(this.app.workspace.on("active-leaf-change", refreshFileExplorer));
-        this.registerEvent(this.app.vault.on("create", refreshFileExplorer));
-        this.registerEvent(this.app.vault.on("delete", refreshFileExplorer));
-        this.registerEvent(this.app.vault.on("rename", refreshFileExplorer));
+        // matching history with a small clock badge. The "has history" check
+        // uses a pre-built Set of note paths rather than per-item
+        // vault.getAbstractFileByPath(), because in mirrored storage mode the
+        // .edtz files live under a dotfile folder (`.edtz/`) that Obsidian's
+        // vault tree may not expose.
+        const runRefresh = () => { void this.refreshFileExplorer(); };
+        this.app.workspace.onLayoutReady(runRefresh);
+        this.registerEvent(this.app.workspace.on("layout-change", runRefresh));
+        this.registerEvent(this.app.workspace.on("active-leaf-change", runRefresh));
+        this.registerEvent(this.app.vault.on("create", runRefresh));
+        this.registerEvent(this.app.vault.on("delete", runRefresh));
+        this.registerEvent(this.app.vault.on("rename", runRefresh));
 
         // "Changes since your last visit" blame overlay in the editor.
         this.registerEditorExtension([blameField]);
@@ -2548,6 +2605,10 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                             `Edit History: moved ${result.moved}, skipped ${result.skipped}` +
                             (result.errors > 0 ? `, ${result.errors} errors (see console)` : "")
                         );
+                        // Force an explicit refresh: rename events during the
+                        // migration may not fire reliably for files crossing
+                        // into / out of a dotfile folder.
+                        await this.plugin.refreshFileExplorer();
                     } catch (e) {
                         progressNotice.hide();
                         logWarn("Migration failed", e);
