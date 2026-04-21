@@ -132,6 +132,7 @@ interface EditHistorySettings {
     debugLevel: string;
     authorName: string;
     authorOverrideTimeoutMinutes: string;
+    useMirroredStorage: boolean;
     // XXX Have color setting for addition fore/back, deletion fore/back
 }
 
@@ -148,8 +149,14 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     showWhitespace: true,
     debugLevel: "warn",
     authorName: "",
-    authorOverrideTimeoutMinutes: "10"
+    authorOverrideTimeoutMinutes: "10",
+    useMirroredStorage: false
 }
+
+// Root folder used when mirrored storage is enabled. Starts with "." so
+// Obsidian's file explorer hides it by default — the whole point of this mode
+// is to get .edtz files out of the user's visible tree.
+const MIRRORED_STORAGE_ROOT = ".edtz";
 
 // Filename format for edits: <epoch36> or <epoch36>$ (full snapshot), with an
 // optional "@<urlencoded-author>" suffix. parseInt(fn, 36) stops at "@"/"$" so
@@ -385,6 +392,101 @@ export default class EditHistory extends Plugin {
         return normalizePath(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
     }
 
+    /**
+     * Given the current vault path of a `.edtz` file, return the path of the
+     * note it belongs to (i.e. strip off the mirrored-root prefix if present,
+     * and the trailing `.edtz`). Returns null if the path doesn't look like a
+     * managed edit-history file.
+     */
+    edtzToNotePath(edtzPath: string): string | null {
+        if (!edtzPath.toLowerCase().endsWith(EDIT_HISTORY_FILE_EXT)) return null;
+        let remainder = edtzPath.slice(0, edtzPath.length - EDIT_HISTORY_FILE_EXT.length);
+        const mirroredPrefix = MIRRORED_STORAGE_ROOT + "/";
+        if (remainder.startsWith(mirroredPrefix)) {
+            remainder = remainder.slice(mirroredPrefix.length);
+        }
+        return remainder.length > 0 ? remainder : null;
+    }
+
+    /**
+     * Move every existing .edtz file into the layout selected by
+     * `targetUseMirrored`. Returns a small summary for the caller to display.
+     * This walks the vault once and uses fileManager.renameFile for each move
+     * so Obsidian's link tracker + any watchers stay consistent.
+     */
+    async migrateEditHistoryFiles(targetUseMirrored: boolean): Promise<{ moved: number; skipped: number; errors: number }> {
+        const edtzFiles = this.app.vault.getFiles().filter(
+            f => f.path.toLowerCase().endsWith(EDIT_HISTORY_FILE_EXT)
+        );
+        let moved = 0;
+        let skipped = 0;
+        let errors = 0;
+        for (const edtz of edtzFiles) {
+            const notePath = this.edtzToNotePath(edtz.path);
+            if (!notePath) { skipped++; continue; }
+            const targetPath = normalizePath(
+                (targetUseMirrored ? (MIRRORED_STORAGE_ROOT + "/") : "") + notePath + EDIT_HISTORY_FILE_EXT
+            );
+            if (targetPath === edtz.path) { skipped++; continue; }
+            // Avoid clobbering: if a destination already exists, keep both
+            // and leave the old one for the user to inspect.
+            if (this.app.vault.getAbstractFileByPath(targetPath) != null) {
+                logWarn("Migration target already exists, skipping", edtz.path, "->", targetPath);
+                errors++;
+                continue;
+            }
+            // Make sure parent folders exist. fileManager.renameFile requires
+            // the destination parent directory.
+            const parent = targetPath.includes("/") ? targetPath.slice(0, targetPath.lastIndexOf("/")) : "";
+            if (parent && this.app.vault.getAbstractFileByPath(parent) == null) {
+                try {
+                    await this.app.vault.createFolder(parent);
+                } catch (e) {
+                    // createFolder throws if the folder already exists (race)
+                    // — that's fine, proceed.
+                    logDbg("createFolder threw (likely already exists)", parent, e);
+                }
+            }
+            try {
+                await this.app.fileManager.renameFile(edtz, targetPath);
+                moved++;
+            } catch (e) {
+                logWarn("Failed to move", edtz.path, "->", targetPath, e);
+                errors++;
+            }
+        }
+        // If we moved everything out of the .edtz root, try to prune the
+        // now-empty mirror tree so there are no ghost folders sitting around.
+        if (!targetUseMirrored) {
+            const root = this.app.vault.getAbstractFileByPath(MIRRORED_STORAGE_ROOT);
+            if (root instanceof TFolder) {
+                await this.pruneEmptyFolders(root);
+            }
+        }
+        return { moved, skipped, errors };
+    }
+
+    /** Recursively delete any folder under `folder` (and folder itself) that
+     *  has no descendants left. Used after a mirrored→sibling migration to
+     *  tidy up the empty `.edtz/...` shadow tree. */
+    async pruneEmptyFolders(folder: TFolder): Promise<boolean> {
+        // Depth-first so children get a chance to become empty first.
+        for (const child of folder.children.slice()) {
+            if (child instanceof TFolder) {
+                await this.pruneEmptyFolders(child);
+            }
+        }
+        if (folder.children.length === 0 && folder.path !== "/" && folder.path !== "") {
+            try {
+                await this.app.vault.delete(folder);
+                return true;
+            } catch (e) {
+                logWarn("Failed to delete empty folder", folder.path, e);
+            }
+        }
+        return false;
+    }
+
     getEditCompressedSize(zip: JSZip, filepath: string): number {
         // The only way of getting the file size is by accessing
         // the internal field _data
@@ -536,9 +638,15 @@ export default class EditHistory extends Plugin {
         this.extensionWhitelist = this.commaSeparatedToList(settings.extensionWhitelist)
         this.substringBlacklist = this.commaSeparatedToList(settings.substringBlacklist);
         this.maxEditHistoryFileSize = parseInt(settings.maxHistoryFileSizeKB) * 1024 || Infinity;
-        // XXX Note this is currently not updated in the settings modal, so the
-        //     value is unchanged
-        this.editHistoryRootFolder = settings.editHistoryRootFolder;
+        // The storage mode toggle drives the root folder. Mirrored mode stores
+        // all .edtz files under a hidden ".edtz" root that mirrors the vault
+        // layout (e.g. `.edtz/Business Plan/Draft ideas.md.edtz`). Sibling mode
+        // stores each .edtz next to its note (e.g.
+        // `Business Plan/Draft ideas.md.edtz`). The underlying path logic is
+        // already parametrized by editHistoryRootFolder, so we only set that.
+        this.editHistoryRootFolder = settings.useMirroredStorage
+            ? MIRRORED_STORAGE_ROOT
+            : (settings.editHistoryRootFolder ?? "");
     }
 
     async loadSettings() {
@@ -1084,7 +1192,7 @@ export default class EditHistory extends Plugin {
                         continue;
                     }
 
-                    const hasHistory = this.app.vault.getAbstractFileByPath(p + EDIT_HISTORY_FILE_EXT) != null;
+                    const hasHistory = this.app.vault.getAbstractFileByPath(this.getEditHistoryFilepath(p)) != null;
                     const existing = titleEl.querySelector(".edit-history-file-badge");
                     if (hasHistory && !existing) {
                         const badge = titleEl.createEl("span", { cls: "edit-history-file-badge" });
@@ -2415,6 +2523,37 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                         this.plugin.settings.substringBlacklist = value;
                         await this.plugin.saveSettings();
                     }));
+
+        // Storage layout: sibling (.edtz next to each note) vs. mirrored (all
+        // .edtz under a hidden .edtz/ root mirroring the vault's folder
+        // structure). Toggling migrates existing files to match the new
+        // layout so the user doesn't end up with a mixed state.
+        new Setting(containerEl)
+            .setName("Store history in hidden folder")
+            .setDesc(`When off (default), each note's .edtz sits beside it (e.g. "Notes/foo.md.edtz"). When on, all history files move to a hidden "${MIRRORED_STORAGE_ROOT}/" folder that mirrors your vault layout (e.g. "${MIRRORED_STORAGE_ROOT}/Notes/foo.md.edtz") — Obsidian hides dotfile folders by default, so it keeps the tree clean. Toggling this moves all existing .edtz files to match.`)
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.useMirroredStorage)
+                .onChange(async (value) => {
+                    logInfo("Storage mode changing to", value ? "mirrored" : "sibling");
+                    this.plugin.settings.useMirroredStorage = value;
+                    await this.plugin.saveSettings();
+                    const progressNotice = new Notice(
+                        `Edit History: moving history files to ${value ? "mirrored" : "sibling"} layout…`,
+                        0
+                    );
+                    try {
+                        const result = await this.plugin.migrateEditHistoryFiles(value);
+                        progressNotice.hide();
+                        new Notice(
+                            `Edit History: moved ${result.moved}, skipped ${result.skipped}` +
+                            (result.errors > 0 ? `, ${result.errors} errors (see console)` : "")
+                        );
+                    } catch (e) {
+                        progressNotice.hide();
+                        logWarn("Migration failed", e);
+                        new Notice("Edit History: migration failed — see console");
+                    }
+                }));
 
         new Setting(containerEl)
             .setName("Author name")
