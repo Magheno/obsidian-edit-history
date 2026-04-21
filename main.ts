@@ -823,6 +823,45 @@ export default class EditHistory extends Plugin {
             })
         );
 
+        // Decorate the file explorer: hide *.edtz rows, mark files that have a
+        // sibling *.edtz with a small clock badge.
+        const refreshFileExplorer = () => {
+            const leaves = this.app.workspace.getLeavesOfType("file-explorer");
+            for (const leaf of leaves) {
+                const view = leaf.view as unknown as { fileItems?: Record<string, { el?: HTMLElement; selfEl?: HTMLElement; titleEl?: HTMLElement }> };
+                const fileItems = view?.fileItems;
+                if (!fileItems) continue;
+                for (const p in fileItems) {
+                    const item = fileItems[p];
+                    const titleEl = item.selfEl ?? item.titleEl;
+                    const rowEl = item.el ?? titleEl?.parentElement ?? undefined;
+                    if (!titleEl || !rowEl) continue;
+
+                    if (p.toLowerCase().endsWith(EDIT_HISTORY_FILE_EXT)) {
+                        rowEl.addClass("edit-history-hidden-file");
+                        continue;
+                    }
+
+                    const hasHistory = this.app.vault.getAbstractFileByPath(p + EDIT_HISTORY_FILE_EXT) != null;
+                    const existing = titleEl.querySelector(".edit-history-file-badge");
+                    if (hasHistory && !existing) {
+                        const badge = titleEl.createEl("span", { cls: "edit-history-file-badge" });
+                        setIcon(badge, "clock");
+                        badge.setAttribute("aria-label", "Has edit history");
+                    } else if (!hasHistory && existing) {
+                        existing.remove();
+                    }
+                }
+            }
+        };
+
+        this.app.workspace.onLayoutReady(refreshFileExplorer);
+        this.registerEvent(this.app.workspace.on("layout-change", refreshFileExplorer));
+        this.registerEvent(this.app.workspace.on("active-leaf-change", refreshFileExplorer));
+        this.registerEvent(this.app.vault.on("create", refreshFileExplorer));
+        this.registerEvent(this.app.vault.on("delete", refreshFileExplorer));
+        this.registerEvent(this.app.vault.on("rename", refreshFileExplorer));
+
 
         this.addSettingTab(new EditHistorySettingTab(this.app, this));
     }
