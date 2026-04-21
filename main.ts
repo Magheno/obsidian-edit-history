@@ -1,17 +1,19 @@
-import { 
-    App, 
-    ButtonComponent, 
+import {
+    App,
+    ButtonComponent,
+    Component,
     DropdownComponent,
-    Modal, 
-    normalizePath, 
+    MarkdownRenderer,
+    Modal,
+    normalizePath,
     Notice,
-    Plugin, 
-    PluginSettingTab, 
+    Plugin,
+    PluginSettingTab,
     setIcon,
-    Setting, 
-    TAbstractFile, 
-    TFile, 
-    TFolder, 
+    Setting,
+    TAbstractFile,
+    TFile,
+    TFolder,
     ToggleComponent
 } from "obsidian";
 import { DiffMatchPatch, Diff } from "diff-match-patch-ts";
@@ -95,6 +97,7 @@ function htmlEncode(str: string, whitespace: boolean): string {
 }
 
 enum DiffDisplayFormat {
+    Page       = "PAGE",
     Raw        = "RAW",
     Timeline   = "TIMELINE",
     Inline     = "INLINE",
@@ -103,6 +106,7 @@ enum DiffDisplayFormat {
 };
 
 const diffDisplayFormatToString: Record<DiffDisplayFormat, string> = {
+    [DiffDisplayFormat.Page]       : "page (rendered)",
     [DiffDisplayFormat.Raw]        : "raw",
     [DiffDisplayFormat.Timeline]   : "timeline",
     [DiffDisplayFormat.Inline]     : "inline",
@@ -135,7 +139,7 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     extensionWhitelist: ".md, .txt, .csv, .htm, .html",
     substringBlacklist: "",
     showOnStatusBar: true,
-    diffDisplayFormat: DiffDisplayFormat.Inline,
+    diffDisplayFormat: DiffDisplayFormat.Page,
     showWhitespace: true,
     debugLevel: "warn",
     authorName: ""
@@ -1025,10 +1029,15 @@ class EditHistoryModal extends Modal {
     currentVersionData: string;
     curDiffIndex: number;
     diffElements: NodeListOf<HTMLElement>;
-    
-    constructor(plugin: EditHistory) { 
+    // Dedicated Component for MarkdownRenderer's lifecycle (event listeners
+    // attached by rendered links/embeds need somewhere to register so they can
+    // be cleaned up when the modal closes).
+    renderComponent: Component;
+
+    constructor(plugin: EditHistory) {
         super(plugin.app);
         this.plugin = plugin;
+        this.renderComponent = new Component();
     }
 
     renderCalendar(calendarDiv: HTMLElement, select: DropdownComponent, zipFile: TFile, zip: JSZip, filepaths: string[]) {
@@ -1578,10 +1587,18 @@ class EditHistoryModal extends Modal {
             }
         });
 
-        const control = contentEl.createDiv("setting-item-control");
+        // OneNote-style two-column layout: left rail of versions, right column
+        // with controls + content. The <select> stays wired up (hidden) so the
+        // existing keyboard navigation (Ctrl+Shift+ArrowUp/Down, etc.) keeps
+        // working without being rewritten around the list.
+        const bodyDiv = contentEl.createDiv("edit-history-body");
+        const versionListDiv = bodyDiv.createDiv("edit-history-version-list");
+        const rightCol = bodyDiv.createDiv("edit-history-right-col");
+
+        const control = rightCol.createDiv("setting-item-control");
         control.style.justifyContent = "flex-start";
         const select = new DropdownComponent(control);
-        select.selectEl.focus();
+        select.selectEl.addClass("edit-history-hidden-select");
 
         const diffDisplaySelect = new DropdownComponent(control)
             .addOptions(diffDisplayFormatToString)
@@ -1673,7 +1690,12 @@ class EditHistoryModal extends Modal {
             }
         });
         
-        const diffDiv = contentEl.createDiv("diff-div");
+        // Change summary banner sits above the diff/page pane and shows how
+        // many lines were added/removed vs. the previous version (OneNote-ish
+        // "something changed here" affordance without requiring per-line
+        // highlights in the rendered page).
+        const changeSummaryDiv = rightCol.createDiv("edit-history-change-summary");
+        const diffDiv = rightCol.createDiv("diff-div");
         let selectedDayCell : HTMLElement|null = null;
         select.onChange( async () => {
             // This is called implicitly from the event dispatcher but also
@@ -1773,7 +1795,79 @@ class EditHistoryModal extends Modal {
             // each line 
             const diffs = dmpobj.diff_main(data, currentData);
             dmpobj.diff_cleanupSemantic(diffs);
+
+            // Count added/removed lines for the summary banner. This is
+            // intentionally coarse — just the count of "\n" inside inserted and
+            // deleted segments — but good enough to tell the user at a glance
+            // that something changed in this version.
+            let addedLines = 0;
+            let removedLines = 0;
+            for (const [op, segment] of diffs) {
+                if (segment.length === 0) continue;
+                const lineCount = (segment.match(/\n/g)?.length ?? 0) || 1;
+                if ((op as number) === DiffOp.Insert) addedLines += lineCount;
+                else if ((op as number) === DiffOp.Delete) removedLines += lineCount;
+            }
+            changeSummaryDiv.empty();
+            if (addedLines > 0 || removedLines > 0) {
+                changeSummaryDiv.createEl("span", {
+                    cls: "edit-history-change-summary-added",
+                    text: `+${addedLines}`
+                });
+                changeSummaryDiv.createEl("span", { text: " / " });
+                changeSummaryDiv.createEl("span", {
+                    cls: "edit-history-change-summary-removed",
+                    text: `-${removedLines}`
+                });
+                changeSummaryDiv.createEl("span", {
+                    cls: "edit-history-change-summary-note",
+                    text: " lines changed vs previous version"
+                });
+            } else {
+                changeSummaryDiv.createEl("span", {
+                    cls: "edit-history-change-summary-note",
+                    text: "No changes vs previous version"
+                });
+            }
+
+            // Highlight the active version in the left rail.
+            versionListDiv.querySelectorAll(".edit-history-version-item.selected")
+                .forEach(el => el.removeClass("selected"));
+            const activeItem = versionListDiv.querySelector(
+                `.edit-history-version-item[data-filepath="${CSS.escape(selectedEdit)}"]`
+            );
+            activeItem?.addClass("selected");
+            activeItem?.scrollIntoView({ block: "nearest" });
+
             const diffDisplayFormat = diffDisplaySelect.getValue() as DiffDisplayFormat;
+
+            // Page mode: render the selected version as live markdown via
+            // Obsidian's MarkdownRenderer. Skip the char-level diff pipeline
+            // below — the change summary banner already tells the reader
+            // what's different, and this pane is meant to look like OneNote's
+            // "view page as it was at this version".
+            if (diffDisplayFormat === DiffDisplayFormat.Page) {
+                diffDiv.empty();
+                const pageView = diffDiv.createDiv("edit-history-page-view markdown-rendered");
+                // Reset the render lifecycle between version switches so
+                // listeners from the previous render get cleaned up.
+                this.renderComponent.unload();
+                this.renderComponent = new Component();
+                this.renderComponent.load();
+                await MarkdownRenderer.render(
+                    this.app,
+                    currentData,
+                    pageView,
+                    file.path,
+                    this.renderComponent
+                );
+                this.currentVersionData = currentData;
+                this.diffElements = diffDiv.querySelectorAll<HTMLElement>(".no-diff-elements-in-page-mode");
+                this.curDiffIndex = 0;
+                diffInfo.setText("page view");
+                return;
+            }
+
             switch (diffDisplayFormat) {
                 case DiffDisplayFormat.Raw:
                     // XXX Missing setting the 1/n diffcount that is displayed
@@ -1868,8 +1962,10 @@ class EditHistoryModal extends Modal {
             });
         });
 
-        // Create option entries
-        for (let filepath of filepaths) {
+        // Create option entries (both the hidden <select> for keyboard nav and
+        // the visible left-rail list).
+        for (let i = 0; i < filepaths.length; i++) {
+            const filepath = filepaths[i];
             // XXX The drop down displays the changes between the selected
             //     date and the immediately older date
             //     This means that:
@@ -1877,10 +1973,25 @@ class EditHistoryModal extends Modal {
             //         contents date that displays the diff from the current
             //         contents to the first file in the history (probably no
             //         changes if a revision was recently saved)
-            //      - the last entry is a diff from that entry's date to the 
+            //      - the last entry is a diff from that entry's date to the
             //        empty file
             //     Missing setting the first dummy entry
             select.addOption(filepath, this.plugin.getEditLocalDateStr(filepath));
+
+            const author = this.plugin.getEditAuthor(filepath) ?? "unknown";
+            const dateStr = this.plugin.getEditDate(filepath).toLocaleString();
+            const itemEl = versionListDiv.createDiv({
+                cls: "edit-history-version-item",
+                attr: { "data-filepath": filepath }
+            });
+            itemEl.createEl("div", { cls: "edit-history-version-date", text: dateStr });
+            itemEl.createEl("div", { cls: "edit-history-version-author", text: author });
+            const itemIndex = i;
+            itemEl.addEventListener("click", () => {
+                if (select.selectEl.selectedIndex === itemIndex) return;
+                select.selectEl.selectedIndex = itemIndex;
+                select.selectEl.trigger("change");
+            });
         }
         // Force initialization done inside onChange
         select.selectEl.trigger("change");
@@ -1893,6 +2004,7 @@ class EditHistoryModal extends Modal {
 
     onClose() {
         logInfo("onClose");
+        this.renderComponent.unload();
         const {contentEl} = this;
         contentEl.empty();
     }

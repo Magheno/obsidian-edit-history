@@ -137,6 +137,102 @@
     display: none;
 }
 
+/* Two-column layout inside the edit history modal: left rail of versions,
+   right column with controls + rendered page / diff. */
+.edit-history-modal-content .edit-history-body {
+    display: flex;
+    flex-direction: row;
+    flex-grow: 1;
+    min-height: 0;
+    gap: var(--size-4-3);
+}
+
+.edit-history-version-list {
+    flex: 0 0 220px;
+    max-width: 220px;
+    overflow-y: auto;
+    border-right: 1px solid var(--background-modifier-border);
+    padding-right: var(--size-4-2);
+}
+
+.edit-history-version-item {
+    padding: var(--size-2-3) var(--size-2-2);
+    border-radius: var(--radius-s);
+    cursor: pointer;
+    margin-bottom: var(--size-2-1);
+    border-left: 3px solid transparent;
+}
+.edit-history-version-item:hover {
+    background-color: var(--background-modifier-hover);
+}
+.edit-history-version-item.selected {
+    background-color: var(--background-modifier-active-hover);
+    border-left-color: var(--interactive-accent);
+}
+.edit-history-version-date {
+    font-size: var(--font-ui-small);
+    color: var(--text-normal);
+    font-weight: 500;
+}
+.edit-history-version-author {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.edit-history-right-col {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    min-width: 0;
+    min-height: 0;
+}
+
+/* The original diff-div stylesheet uses flex-grow inside
+   .edit-history-modal-content; inside the new right column it still needs to
+   fill remaining space. */
+.edit-history-right-col > .diff-div {
+    flex-grow: 1;
+    min-height: 0;
+}
+
+/* Hidden <select> kept purely for existing keyboard-nav code paths. */
+.edit-history-hidden-select {
+    display: none;
+}
+
+/* Change summary banner above the page/diff pane. */
+.edit-history-change-summary {
+    padding: var(--size-2-2) 0;
+    font-size: var(--font-ui-small);
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--background-modifier-border);
+    margin-bottom: var(--size-2-2);
+}
+.edit-history-change-summary-added {
+    color: var(--color-green);
+    font-weight: 600;
+}
+.edit-history-change-summary-removed {
+    color: var(--color-red);
+    font-weight: 600;
+}
+.edit-history-change-summary-note {
+    color: var(--text-muted);
+}
+
+/* Page view: render the selected version's markdown with normal margins so
+   it reads like an Obsidian note, not like a diff. */
+.edit-history-page-view {
+    padding: var(--size-4-2);
+    overflow-y: auto;
+    font-family: var(--font-text);
+}
+.edit-history-page-view p,
+.edit-history-page-view li {
+    line-height: var(--line-height-normal);
+}
+
 /* Small clock badge next to files that have a sibling .edtz history */
 .edit-history-file-badge {
     display: inline-flex;
