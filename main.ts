@@ -393,6 +393,66 @@ export default class EditHistory extends Plugin {
     }
 
     /**
+     * The history-file I/O goes through the low-level vault.adapter, not
+     * vault.getAbstractFileByPath + vault.readBinary, because Obsidian's
+     * vault tree does not reliably expose files inside dotfile folders
+     * (`.edtz/`) — which means the modal, blame logic, and save path would
+     * all think history doesn't exist when mirrored storage is active. The
+     * adapter reads the actual filesystem.
+     */
+    async editHistoryExists(notePath: string): Promise<boolean> {
+        return this.app.vault.adapter.exists(this.getEditHistoryFilepath(notePath));
+    }
+
+    async readEditHistoryBinary(notePath: string): Promise<ArrayBuffer | null> {
+        const p = this.getEditHistoryFilepath(notePath);
+        if (!(await this.app.vault.adapter.exists(p))) return null;
+        return this.app.vault.adapter.readBinary(p);
+    }
+
+    async writeEditHistoryBinary(notePath: string, data: ArrayBuffer): Promise<void> {
+        const p = this.getEditHistoryFilepath(notePath);
+        await this.ensureParentFolder(p);
+        await this.app.vault.adapter.writeBinary(p, data);
+    }
+
+    async deleteEditHistory(notePath: string): Promise<void> {
+        const p = this.getEditHistoryFilepath(notePath);
+        if (await this.app.vault.adapter.exists(p)) {
+            await this.app.vault.adapter.remove(p);
+        }
+    }
+
+    async renameEditHistory(oldNotePath: string, newNotePath: string): Promise<boolean> {
+        const oldP = this.getEditHistoryFilepath(oldNotePath);
+        const newP = this.getEditHistoryFilepath(newNotePath);
+        if (oldP === newP) return false;
+        if (!(await this.app.vault.adapter.exists(oldP))) return false;
+        if (await this.app.vault.adapter.exists(newP)) {
+            logWarn("Rename target already exists, skipping", newP);
+            return false;
+        }
+        await this.ensureParentFolder(newP);
+        await this.app.vault.adapter.rename(oldP, newP);
+        return true;
+    }
+
+    async ensureParentFolder(path: string): Promise<void> {
+        const slash = path.lastIndexOf("/");
+        if (slash <= 0) return;
+        const parent = path.slice(0, slash);
+        if (await this.app.vault.adapter.exists(parent)) return;
+        try {
+            await this.app.vault.createFolder(parent);
+        } catch (e) {
+            // createFolder races with other code creating the same parent —
+            // if it throws because the folder now exists that's fine, the
+            // next write will succeed.
+            logDbg("createFolder threw (likely already exists)", parent, e);
+        }
+    }
+
+    /**
      * Given the current vault path of a `.edtz` file, return the path of the
      * note it belongs to (i.e. strip off the mirrored-root prefix if present,
      * and the trailing `.edtz`). Returns null if the path doesn't look like a
@@ -769,12 +829,14 @@ export default class EditHistory extends Plugin {
 
             let file = fileOrFolder as TFile;
             let zipFilepath = this.getEditHistoryFilepath(file.path);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if ((zipFile != null) && !(zipFile instanceof TFile)) {
-                // Not a file, error
-                logError("Edit history file is not a file", zipFilepath);
-                return;
-            }
+            // We used to use vault.getAbstractFileByPath here, but Obsidian's
+            // vault tree does not reliably expose files inside dotfile folders
+            // (which is exactly where mirrored storage puts them). Switch to
+            // the low-level adapter which reads the filesystem directly.
+            const zipStat = (await this.app.vault.adapter.exists(zipFilepath))
+                ? await this.app.vault.adapter.stat(zipFilepath)
+                : null;
+            const zipExists = zipStat != null;
             
             // XXX Cleanup all naming:
             //
@@ -840,10 +902,10 @@ export default class EditHistory extends Plugin {
             //        unrelated edits when the app is closed before the timer
             //        expires. The timer needs to be per file/editor?
             //     See https://github.com/antoniotejada/obsidian-edit-history/issues/9
-            if (!force && 
-                (zipFile != null) && ((file.stat.mtime - zipFile.stat.mtime) < this.minMsBetweenEdits)) {
-                logDbg("Need to pass", 
-                    (this.minMsBetweenEdits - (file.stat.mtime - zipFile.stat.mtime)) / 1000, "s between edits, ignoring");
+            if (!force && zipStat != null &&
+                ((file.stat.mtime - zipStat.mtime) < this.minMsBetweenEdits)) {
+                logDbg("Need to pass",
+                    (this.minMsBetweenEdits - (file.stat.mtime - zipStat.mtime)) / 1000, "s between edits, ignoring");
                 return;
             }
 
@@ -886,7 +948,9 @@ export default class EditHistory extends Plugin {
 
             // Create or open the zip with the versions of this file
             let zip: JSZip = new JSZip();
-            let zipData = (zipFile == null) ? null : await this.app.vault.readBinary(zipFile);
+            let zipData: ArrayBuffer | null = zipExists
+                ? await this.app.vault.adapter.readBinary(zipFilepath)
+                : null;
             let numEdits = 0;
             if (zipData != null) {
                 // There's an existing zip file, update the most recent
@@ -1057,31 +1121,13 @@ export default class EditHistory extends Plugin {
             
             // Generate zip archive and save
             let newZipData = await zip.generateAsync({type: "arraybuffer", compression: "DEFLATE"});
-            if (zipFile == null) {
-                // No existing zip file, create
-                
-                // The directory may not exist if history files are not saved
-                // alongside notes, and createBinary won't create the directory,
-                // so create it here. Do it unconditionally for simplicity and
-                // ignore errors, let createBinary fail if there was a problem
-                
-                // XXX Obsidian has issues with directories starting with "." :
-                //     - createBinary succeeds in creating the binary in a
-                //       directory starting with "." but returns null instead of a TFile
-                //     - createFolder succeeds in creating a folder starting with "."
-                //     - getAbstractFileByPath of a path starting with "." returns null
-                let dirpath = zipFilepath.substring(0, zipFilepath.lastIndexOf("/")+1);
-                logInfo("Conservatively creating dir", dirpath);
-                await this.app.vault.createFolder(dirpath).catch(()=>null);
-                let zipFile = await this.app.vault.createBinary(zipFilepath, newZipData);
-                if (zipFile == null) {
-                    logError("Can't create edit history file", zipFilepath);
-                    return;
-                }
-            } else {
-                // Update the zip file
-                await this.app.vault.modifyBinary(zipFile, newZipData);
-            }
+            // Write the (possibly-new) zip via the adapter. This handles both
+            // create and overwrite, and — critically — it works for files
+            // inside dotfile folders where vault.createBinary returns null
+            // despite succeeding. ensureParentFolder creates intermediate
+            // directories when the mirrored root doesn't exist yet.
+            await this.ensureParentFolder(zipFilepath);
+            await this.app.vault.adapter.writeBinary(zipFilepath, newZipData);
             // XXX This needs to update when switching panes, etc, or set a timer
             this.statusBarItemEl.setText((numEdits + 1) + " edits");
         }));
@@ -1132,14 +1178,11 @@ export default class EditHistory extends Plugin {
                 return;
             }
 
-            // Rename the edit history file if any
-            let zipFilepath = this.getEditHistoryFilepath(oldPath);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if (zipFile != null) {
-                let newZipFilepath = this.getEditHistoryFilepath(file.path);
-                logInfo("Renaming edit history file", zipFilepath,"to", newZipFilepath);
-                this.app.vault.rename(zipFile, newZipFilepath);
-            }
+            // Rename the edit history file if any (adapter-based so it works
+            // regardless of whether the .edtz is inside a dotfile folder).
+            void this.renameEditHistory(oldPath, file.path).catch(e => {
+                logWarn("Failed to rename edit history file", oldPath, "->", file.path, e);
+            });
         }));
 
         this.registerEvent(this.app.vault.on("delete", (file: TAbstractFile) => {
@@ -1150,16 +1193,12 @@ export default class EditHistory extends Plugin {
                 logDbg("Ignoring non whitelisted file", file.path);
                 return;
             }
-            // Delete the edit history file if any
-            let zipFilepath = this.getEditHistoryFilepath(file.path);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if (zipFile != null) {
-                logInfo("Deleting edit history file", zipFilepath);
-                // XXX Should this trash instead of delete? (the Obsidian
-                //     setting under Files and Links allows choosing between
-                //     system trash, obsidian trash and delete)
-                this.app.vault.delete(zipFile);
-            }
+            // Delete the edit history file if any (adapter-based so it works
+            // regardless of whether the .edtz is inside a dotfile folder).
+            const zipFilepath = this.getEditHistoryFilepath(file.path);
+            void this.deleteEditHistory(file.path).catch(e => {
+                logWarn("Failed to delete edit history file", zipFilepath, e);
+            });
         }));
 
         // XXX Use notices for some information/error messages
@@ -1332,11 +1371,7 @@ export default class EditHistory extends Plugin {
             return [];
         }
 
-        const zipFilepath = this.getEditHistoryFilepath(file.path);
-        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-        if (!(zipFile instanceof TFile)) return [];
-
-        const zipData = await this.app.vault.readBinary(zipFile);
+        const zipData = await this.readEditHistoryBinary(file.path);
         if (!zipData) return [];
 
         const zip = new JSZip();
@@ -1516,7 +1551,7 @@ class EditHistoryModal extends Modal {
         this.renderComponent = new Component();
     }
 
-    renderCalendar(calendarDiv: HTMLElement, select: DropdownComponent, zipFile: TFile, zip: JSZip, filepaths: string[]) {
+    renderCalendar(calendarDiv: HTMLElement, select: DropdownComponent, zipFileSize: number, zip: JSZip, filepaths: string[]) {
         // XXX Abstract this more? problems are revstats requiring the zip file
         //     or recalculate values outside. select should also be removed and
         //     take a cell onclick callback or do the cell onclick in the caller?
@@ -1677,7 +1712,7 @@ class EditHistoryModal extends Modal {
         // XXX Use human friendly units (KB, MB, GB, etc)
         revStats.setText(
             `${numFiles}/${filepaths.length} edit${(filepaths.length > 1) ? "s " : " "}` +
-            `${fileSize}/${(zipFile as TFile).stat.size} bytes compressed, ${this.app.workspace.getActiveFile()?.stat.size} note bytes`
+            `${fileSize}/${zipFileSize} bytes compressed, ${this.app.workspace.getActiveFile()?.stat.size} note bytes`
         );
     }
 
@@ -2012,20 +2047,23 @@ class EditHistoryModal extends Modal {
         // this.minMsBetweenEdits
         const latestData = await this.app.vault.read(file);
     
-        // Create or open the zip with the edit history of this file
-
+        // Create or open the zip with the edit history of this file.
+        // Uses the adapter, not vault.getAbstractFileByPath, because
+        // mirrored storage puts .edtz inside `.edtz/` which Obsidian's
+        // vault tree does not reliably expose.
         // XXX Review perf notes at https://stuk.github.io/jszip/documentation/limitations.html
         const zip: JSZip = new JSZip();
         const zipFilepath = this.plugin.getEditHistoryFilepath(file.path);
         logInfo("Opening zip file ", zipFilepath);
-        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-        if ((zipFile == null) || (!(zipFile instanceof TFile))) {
-            logWarn("No history file or not a file", zipFilepath);
+        const adapter = this.app.vault.adapter;
+        if (!(await adapter.exists(zipFilepath))) {
+            logWarn("No history file", zipFilepath);
             contentEl.createEl("p", { text: "No edit history file"});
             return;
         }
-        
-        const zipData = await this.app.vault.readBinary(zipFile);
+        const zipStat = await adapter.stat(zipFilepath);
+        const zipFileSize = zipStat?.size ?? 0;
+        const zipData = await adapter.readBinary(zipFilepath);
         if (zipData == null) {
             logWarn("Unable to read history file");
             contentEl.createEl("p", { text: "No edit history"});
@@ -2194,7 +2232,7 @@ class EditHistoryModal extends Modal {
                 selectedDayCell.addClass("calendar-selected");
                 selectedDayCell.removeClass("calendar-level");
             } else {
-                this.renderCalendar(calendarDiv, select, zipFile as TFile, zip, filepaths);
+                this.renderCalendar(calendarDiv, select, zipFileSize, zip, filepaths);
                 selectedDayCell = document.getElementById(`calendar-${selectedFileTime}`) as HTMLElement|null;
             }
 
