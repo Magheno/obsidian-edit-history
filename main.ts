@@ -943,7 +943,15 @@ export default class EditHistory extends Plugin {
 
             // Load the modified file data
             let fileData = await this.app.vault.read(file);
-            const currentAuthor = await this.getCurrentAuthor();
+            // UI edits (you typing in Obsidian) bypass the override file —
+            // otherwise an agent that set the override and forgot to clear
+            // would hijack your manual saves. External writes (agents
+            // modifying .md files directly) never fire editor-change and
+            // fall through to the full getCurrentAuthor chain including
+            // the override file.
+            const currentAuthor = this.isRecentUiEdit(file.path)
+                ? this.getUiAuthor()
+                : await this.getCurrentAuthor();
             let newFilename = this.buildEditFilename(file.stat.mtime, false, currentAuthor);
 
             // Create or open the zip with the versions of this file
@@ -1308,6 +1316,16 @@ export default class EditHistory extends Plugin {
         this.registerEvent(this.app.vault.on("delete", runRefresh));
         this.registerEvent(this.app.vault.on("rename", runRefresh));
 
+        // Mark "a human just typed here" so the modify handler below can
+        // distinguish UI saves from external-agent writes. editor-change
+        // only fires for edits made through Obsidian's editor — external
+        // file writes go straight through the vault modify event without
+        // firing this one.
+        this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
+            const file = (info as { file?: TFile | null } | undefined)?.file;
+            if (file) this.lastUiEditByPath.set(file.path, Date.now());
+        }));
+
         // "Changes since your last visit" blame overlay in the editor.
         this.registerEditorExtension([blameField]);
         this.registerEvent(this.app.workspace.on("file-open", (file) => {
@@ -1348,6 +1366,42 @@ export default class EditHistory extends Plugin {
     }
 
     lastActiveFilePath: string | null = null;
+
+    // Timestamp (ms) of the most recent editor-change event per file path.
+    // Used to distinguish saves triggered by the Obsidian UI (you typing)
+    // from saves triggered by external writes (an AI agent rewriting the
+    // .md file directly). External writes never fire editor-change, so a
+    // save without a recent UI timestamp is attributed via the override
+    // file chain; a save WITH a recent UI timestamp is attributed via the
+    // setting directly, skipping the override so agents can't hijack your
+    // manual typing when they forgot to clear their override.
+    lastUiEditByPath: Map<string, number> = new Map();
+    static UI_EDIT_WINDOW_MS = 5000;
+
+    isRecentUiEdit(filePath: string): boolean {
+        const ts = this.lastUiEditByPath.get(filePath);
+        if (!ts) return false;
+        return (Date.now() - ts) < EditHistory.UI_EDIT_WINDOW_MS;
+    }
+
+    /**
+     * Resolve the author to tag on a UI edit. Skips the override file on
+     * purpose — overrides are for external processes.
+     */
+    getUiAuthor(): string {
+        if (this.settings.authorName && this.settings.authorName.trim().length > 0) {
+            return this.settings.authorName.trim();
+        }
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const os = require("os");
+            const host = os?.hostname?.();
+            if (host) return String(host);
+        } catch {
+            // Mobile: no node modules.
+        }
+        return "unknown";
+    }
 
     /**
      * For each line in `file`'s current content, attribute it to the author
@@ -2656,7 +2710,7 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
 
         new Setting(containerEl)
             .setName("Author name")
-            .setDesc(`Name tagged onto each new edit. An external CLI or agent can override this per-edit by writing the author name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear, or let it auto-expire via the timeout below). Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
+            .setDesc(`Name tagged onto each new edit you make in the Obsidian editor. External processes (AI agents writing files directly) can override this by writing their name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear, or let it auto-expire via the timeout below). Saves triggered by you typing in Obsidian always use this Author name and ignore the override — agents can't hijack your manual edits. Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
             .addText(text => text
                 .setPlaceholder("e.g. Mark Volders")
                 .setValue(this.plugin.settings.authorName)
