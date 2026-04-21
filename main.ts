@@ -122,7 +122,8 @@ interface EditHistorySettings {
     diffDisplayFormat: string;
     showWhitespace: boolean;
     debugLevel: string;
-    // XXX Have color setting for addition fore/back, deletion fore/back 
+    authorName: string;
+    // XXX Have color setting for addition fore/back, deletion fore/back
 }
 
 const DEFAULT_SETTINGS: EditHistorySettings = {
@@ -136,8 +137,21 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     showOnStatusBar: true,
     diffDisplayFormat: DiffDisplayFormat.Inline,
     showWhitespace: true,
-    debugLevel: "warn"
+    debugLevel: "warn",
+    authorName: ""
 }
+
+// Filename format for edits: <epoch36> or <epoch36>$ (full snapshot), with an
+// optional "@<urlencoded-author>" suffix. parseInt(fn, 36) stops at "@"/"$" so
+// the epoch still parses out of either variant.
+const EDIT_AUTHOR_DELIM = "@";
+
+// Path inside the plugin's config dir (relative to vault root) that an external
+// process — CLI, AI agent — can write/delete to override the active author for
+// subsequent edits. Content is the author name (whitespace-trimmed). If the
+// file is empty or missing the active author falls back to settings.authorName
+// then the device hostname then "unknown".
+const AUTHOR_OVERRIDE_FILE = "current-author";
 
 const EDIT_HISTORY_FILE_EXT = ".edtz";
 
@@ -260,7 +274,9 @@ export default class EditHistory extends Plugin {
     }
 
     getEditLocalDateStr(editFilename: string): string {
-        return this.getEditDate(editFilename).toLocaleString();
+        const date = this.getEditDate(editFilename).toLocaleString();
+        const author = this.getEditAuthor(editFilename);
+        return author ? `${date} — ${author}` : `${date} — unknown`;
     }
 
     getEditFileTime(editFilename: string): number {
@@ -272,13 +288,61 @@ export default class EditHistory extends Plugin {
     }
 
     getEditIsDiff(editFilename: string): boolean {
-        return !editFilename.endsWith("$");
+        // Full snapshots end with "$" in the epoch portion; an optional
+        // "@<author>" suffix may follow either variant.
+        const atIdx = editFilename.indexOf(EDIT_AUTHOR_DELIM);
+        const epochPart = atIdx === -1 ? editFilename : editFilename.slice(0, atIdx);
+        return !epochPart.endsWith("$");
     }
-    
-    buildEditFilename(mtime: number, isDiff: boolean): string {
+
+    getEditAuthor(editFilename: string): string | null {
+        const atIdx = editFilename.indexOf(EDIT_AUTHOR_DELIM);
+        if (atIdx === -1) return null;
+        const raw = editFilename.slice(atIdx + 1);
+        if (raw.length === 0) return null;
+        try {
+            return decodeURIComponent(raw);
+        } catch {
+            return raw;
+        }
+    }
+
+    buildEditFilename(mtime: number, isDiff: boolean, author?: string | null): string {
         const utcepoch = Math.floor(mtime / 1000);
-        const editFilename = utcepoch.toString(36) + (isDiff ? "" : "$"); 
+        let editFilename = utcepoch.toString(36) + (isDiff ? "" : "$");
+        if (author) {
+            editFilename += EDIT_AUTHOR_DELIM + encodeURIComponent(author);
+        }
         return editFilename;
+    }
+
+    async getCurrentAuthor(): Promise<string> {
+        // Priority: runtime override file > settings > OS hostname > "unknown".
+        // The override file lets an external CLI / agent set the active author
+        // without re-opening Obsidian settings.
+        try {
+            const overridePath = normalizePath(
+                `${this.app.vault.configDir}/plugins/${this.manifest.id}/${AUTHOR_OVERRIDE_FILE}`
+            );
+            if (await this.app.vault.adapter.exists(overridePath)) {
+                const raw = (await this.app.vault.adapter.read(overridePath)).trim();
+                if (raw.length > 0) return raw;
+            }
+        } catch (e) {
+            logWarn("Failed reading author override file", e);
+        }
+        if (this.settings.authorName && this.settings.authorName.trim().length > 0) {
+            return this.settings.authorName.trim();
+        }
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const os = require("os");
+            const host = os?.hostname?.();
+            if (host) return String(host);
+        } catch {
+            // Mobile has no node modules; fall through.
+        }
+        return "unknown";
     }
 
     /**
@@ -477,7 +541,8 @@ export default class EditHistory extends Plugin {
 
             // Load the modified file data
             let fileData = await this.app.vault.read(file);
-            let newFilename = this.buildEditFilename(file.stat.mtime, false);
+            const currentAuthor = await this.getCurrentAuthor();
+            let newFilename = this.buildEditFilename(file.stat.mtime, false, currentAuthor);
 
             // Create or open the zip with the versions of this file
             let zip: JSZip = new JSZip();
@@ -595,13 +660,17 @@ export default class EditHistory extends Plugin {
                         // the diff is larger than the original
                         if (patch.length < prevFileData.length) {
                             // Replace the previous version with a diff wrt the
-                            // newest version
+                            // newest version — carry over its author so we
+                            // don't rewrite history by replacing with the
+                            // current author.
                             logInfo("Removing ", mostRecentFilename);
+                            const prevAuthor = this.getEditAuthor(mostRecentFilename);
                             zip.remove(mostRecentFilename);
                             // Store as a diff
                             mostRecentFilename = this.buildEditFilename(
-                                this.getEditEpoch(mostRecentFilename), 
-                                true
+                                this.getEditEpoch(mostRecentFilename),
+                                true,
+                                prevAuthor
                             );
                             logInfo("Storing ", mostRecentFilename, " with date ", 
                                 mostRecentFile.date, " timestamp ", mostRecentFile.extendedTimestamp);
@@ -806,6 +875,29 @@ export default class EditHistory extends Plugin {
             }
         });
 
+        this.addCommand({
+            id: "set-active-author",
+            name: "Set active author (overrides setting for new edits)",
+            callback: async () => {
+                const current = await this.getCurrentAuthor();
+                new AuthorPromptModal(this, current, async (value) => {
+                    const overridePath = normalizePath(
+                        `${this.app.vault.configDir}/plugins/${this.manifest.id}/${AUTHOR_OVERRIDE_FILE}`
+                    );
+                    const trimmed = value.trim();
+                    if (trimmed.length === 0) {
+                        if (await this.app.vault.adapter.exists(overridePath)) {
+                            await this.app.vault.adapter.remove(overridePath);
+                        }
+                        new Notice("Edit History: active author cleared (using fallback)");
+                    } else {
+                        await this.app.vault.adapter.write(overridePath, trimmed);
+                        new Notice(`Edit History: active author set to "${trimmed}"`);
+                    }
+                }).open();
+            }
+        });
+
         this.registerEvent(
             this.app.workspace.on("file-menu", (menu, file) => {
                 if (!(file instanceof TFile)) return;
@@ -871,7 +963,64 @@ export default class EditHistory extends Plugin {
     }
 }
 
-class EditHistoryModal extends Modal { 
+class AuthorPromptModal extends Modal {
+    plugin: EditHistory;
+    initialValue: string;
+    onSubmit: (value: string) => void | Promise<void>;
+
+    constructor(plugin: EditHistory, initialValue: string, onSubmit: (value: string) => void | Promise<void>) {
+        super(plugin.app);
+        this.plugin = plugin;
+        this.initialValue = initialValue;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl, titleEl } = this;
+        titleEl.setText("Set active author");
+        contentEl.createEl("p", {
+            text: "Name tagged onto new edits until cleared. Empty input falls back to the setting / device hostname."
+        });
+
+        const input = contentEl.createEl("input", { type: "text" });
+        input.value = this.initialValue;
+        input.style.width = "100%";
+        input.style.marginBottom = "1em";
+        input.focus();
+        input.select();
+
+        const submit = async () => {
+            const value = input.value;
+            this.close();
+            await this.onSubmit(value);
+        };
+
+        input.addEventListener("keydown", (evt) => {
+            if (evt.key === "Enter") {
+                evt.preventDefault();
+                submit();
+            }
+        });
+
+        const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+        const saveBtn = buttons.createEl("button", { text: "Save" });
+        saveBtn.addClass("mod-cta");
+        saveBtn.addEventListener("click", submit);
+        const clearBtn = buttons.createEl("button", { text: "Clear" });
+        clearBtn.addEventListener("click", async () => {
+            input.value = "";
+            await submit();
+        });
+        const cancelBtn = buttons.createEl("button", { text: "Cancel" });
+        cancelBtn.addEventListener("click", () => this.close());
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+class EditHistoryModal extends Modal {
     plugin: EditHistory;
     currentVersionData: string;
     curDiffIndex: number;
@@ -1843,6 +1992,18 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                         this.plugin.settings.substringBlacklist = value;
                         await this.plugin.saveSettings();
                     }));
+
+        new Setting(containerEl)
+            .setName("Author name")
+            .setDesc(`Name tagged onto each new edit. An external CLI or agent can override this per-edit by writing the author name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear). Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
+            .addText(text => text
+                .setPlaceholder("e.g. Mark Volders")
+                .setValue(this.plugin.settings.authorName)
+                .onChange(async (value) => {
+                    logInfo("Author name: " + value);
+                    this.plugin.settings.authorName = value;
+                    await this.plugin.saveSettings();
+                }));
 
         containerEl.createEl("h3", {text: "Appearance"});
         new Setting(containerEl)
