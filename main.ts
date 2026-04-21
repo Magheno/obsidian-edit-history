@@ -131,6 +131,7 @@ interface EditHistorySettings {
     showWhitespace: boolean;
     debugLevel: string;
     authorName: string;
+    authorOverrideTimeoutMinutes: string;
     // XXX Have color setting for addition fore/back, deletion fore/back
 }
 
@@ -146,7 +147,8 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     diffDisplayFormat: DiffDisplayFormat.Page,
     showWhitespace: true,
     debugLevel: "warn",
-    authorName: ""
+    authorName: "",
+    authorOverrideTimeoutMinutes: "10"
 }
 
 // Filename format for edits: <epoch36> or <epoch36>$ (full snapshot), with an
@@ -441,17 +443,40 @@ export default class EditHistory extends Plugin {
         return editFilename;
     }
 
+    getAuthorOverridePath(): string {
+        return normalizePath(
+            `${this.app.vault.configDir}/plugins/${this.manifest.id}/${AUTHOR_OVERRIDE_FILE}`
+        );
+    }
+
     async getCurrentAuthor(): Promise<string> {
         // Priority: runtime override file > settings > OS hostname > "unknown".
         // The override file lets an external CLI / agent set the active author
-        // without re-opening Obsidian settings.
+        // without re-opening Obsidian settings. If the override file hasn't
+        // been touched within `authorOverrideTimeoutMinutes`, it's treated as
+        // stale (agent forgot to clean up) and removed — future saves then
+        // fall back to the user's setting, preventing agent names from
+        // "poisoning" manual edits made after the agent session ended.
         try {
-            const overridePath = normalizePath(
-                `${this.app.vault.configDir}/plugins/${this.manifest.id}/${AUTHOR_OVERRIDE_FILE}`
-            );
+            const overridePath = this.getAuthorOverridePath();
             if (await this.app.vault.adapter.exists(overridePath)) {
-                const raw = (await this.app.vault.adapter.read(overridePath)).trim();
-                if (raw.length > 0) return raw;
+                const timeoutMin = parseInt(this.settings.authorOverrideTimeoutMinutes, 10);
+                if (timeoutMin > 0) {
+                    const stat = await this.app.vault.adapter.stat(overridePath);
+                    const ageMs = stat ? Date.now() - stat.mtime : 0;
+                    if (ageMs > timeoutMin * 60 * 1000) {
+                        logInfo(`Author override stale (age ${Math.round(ageMs / 60000)}m > ${timeoutMin}m); removing`, overridePath);
+                        await this.app.vault.adapter.remove(overridePath);
+                        // Fall through to settings / hostname.
+                    } else {
+                        const raw = (await this.app.vault.adapter.read(overridePath)).trim();
+                        if (raw.length > 0) return raw;
+                    }
+                } else {
+                    // Timeout disabled — override is permanent until cleared.
+                    const raw = (await this.app.vault.adapter.read(overridePath)).trim();
+                    if (raw.length > 0) return raw;
+                }
             }
         } catch (e) {
             logWarn("Failed reading author override file", e);
@@ -2393,7 +2418,7 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
 
         new Setting(containerEl)
             .setName("Author name")
-            .setDesc(`Name tagged onto each new edit. An external CLI or agent can override this per-edit by writing the author name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear). Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
+            .setDesc(`Name tagged onto each new edit. An external CLI or agent can override this per-edit by writing the author name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear, or let it auto-expire via the timeout below). Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
             .addText(text => text
                 .setPlaceholder("e.g. Mark Volders")
                 .setValue(this.plugin.settings.authorName)
@@ -2402,6 +2427,54 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                     this.plugin.settings.authorName = value;
                     await this.plugin.saveSettings();
                 }));
+
+        new Setting(containerEl)
+            .setName("Author override timeout (minutes)")
+            .setDesc("If the author override file hasn't been touched within this many minutes, it's auto-deleted and future edits fall back to the Author name above. Default 10. Set to 0 to disable auto-cleanup (overrides stay until cleared manually). This prevents an AI agent's transient author from sticking around on subsequent manual edits.")
+            .addText(text => text
+                .setPlaceholder(DEFAULT_SETTINGS.authorOverrideTimeoutMinutes)
+                .setValue(this.plugin.settings.authorOverrideTimeoutMinutes)
+                .onChange(async (value) => {
+                    logInfo("Author override timeout: " + value);
+                    this.plugin.settings.authorOverrideTimeoutMinutes = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Show the currently-effective author so the user can see at a glance
+        // whether a stale override file is hijacking their edits.
+        const effectiveRow = new Setting(containerEl)
+            .setName("Currently tagging edits as")
+            .setDesc("Resolved right now from: override file > Author name > device hostname.");
+        const effectiveText = effectiveRow.controlEl.createEl("code", { text: "…" });
+        effectiveText.style.userSelect = "text";
+        const refreshEffective = async () => {
+            const name = await this.plugin.getCurrentAuthor();
+            effectiveText.setText(name);
+            const overrideExists = await this.plugin.app.vault.adapter.exists(
+                this.plugin.getAuthorOverridePath()
+            );
+            effectiveText.style.color = overrideExists
+                ? "var(--color-orange)"
+                : "var(--text-normal)";
+        };
+        refreshEffective();
+        effectiveRow.addExtraButton(btn => btn
+            .setIcon("refresh-cw")
+            .setTooltip("Refresh")
+            .onClick(() => refreshEffective()));
+        effectiveRow.addExtraButton(btn => btn
+            .setIcon("trash-2")
+            .setTooltip("Delete override file now")
+            .onClick(async () => {
+                const p = this.plugin.getAuthorOverridePath();
+                if (await this.plugin.app.vault.adapter.exists(p)) {
+                    await this.plugin.app.vault.adapter.remove(p);
+                    new Notice("Author override cleared");
+                } else {
+                    new Notice("No override file to clear");
+                }
+                refreshEffective();
+            }));
 
         containerEl.createEl("h3", {text: "Appearance"});
         new Setting(containerEl)
