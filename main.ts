@@ -132,6 +132,12 @@ interface EditHistorySettings {
     debugLevel: string;
     authorName: string;
     authorOverrideTimeoutMinutes: string;
+    // Vault-shared map of OS hostname -> author name. When set, takes priority
+    // over `authorName` so a single shared `data.json` correctly attributes
+    // edits made on different devices to different humans (e.g.
+    // {"Crest": "Raf Peeters", "APL-BBB": "Mark Volders"}). The override file
+    // still wins so external agents can self-identify.
+    deviceAuthors: Record<string, string>;
     useMirroredStorage: boolean;
     // XXX Have color setting for addition fore/back, deletion fore/back
 }
@@ -150,6 +156,7 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     debugLevel: "warn",
     authorName: "",
     authorOverrideTimeoutMinutes: "10",
+    deviceAuthors: {},
     useMirroredStorage: false
 }
 
@@ -693,14 +700,48 @@ export default class EditHistory extends Plugin {
         );
     }
 
+    /**
+     * Returns this device's OS hostname, or empty string if unavailable
+     * (mobile platforms have no `os` module). The hostname is used as the key
+     * into `settings.deviceAuthors` and as the final fallback author name.
+     */
+    getDeviceHostname(): string {
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const os = require("os");
+            const host = os?.hostname?.();
+            return host ? String(host) : "";
+        } catch {
+            // Mobile: no node modules.
+            return "";
+        }
+    }
+
+    /**
+     * Looks up this device in the vault-shared `deviceAuthors` map and
+     * returns the configured author for the device's hostname. Returns ""
+     * if the hostname is unknown, the map is empty, or there is no entry —
+     * so callers can simply check truthiness and fall through to other
+     * sources.
+     */
+    resolveDeviceAuthor(): string {
+        const host = this.getDeviceHostname();
+        if (!host) return "";
+        const map = this.settings.deviceAuthors || {};
+        const direct = map[host];
+        if (direct && direct.trim().length > 0) return direct.trim();
+        return "";
+    }
+
     async getCurrentAuthor(): Promise<string> {
-        // Priority: runtime override file > settings > OS hostname > "unknown".
+        // Priority: runtime override file > deviceAuthors[hostname] > settings.authorName > OS hostname > "unknown".
         // The override file lets an external CLI / agent set the active author
         // without re-opening Obsidian settings. If the override file hasn't
         // been touched within `authorOverrideTimeoutMinutes`, it's treated as
         // stale (agent forgot to clean up) and removed — future saves then
-        // fall back to the user's setting, preventing agent names from
-        // "poisoning" manual edits made after the agent session ended.
+        // fall back to deviceAuthors / settings / hostname, preventing agent
+        // names from "poisoning" manual edits made after the agent session
+        // ended.
         try {
             const overridePath = this.getAuthorOverridePath();
             if (await this.app.vault.adapter.exists(overridePath)) {
@@ -711,7 +752,7 @@ export default class EditHistory extends Plugin {
                     if (ageMs > timeoutMin * 60 * 1000) {
                         logInfo(`Author override stale (age ${Math.round(ageMs / 60000)}m > ${timeoutMin}m); removing`, overridePath);
                         await this.app.vault.adapter.remove(overridePath);
-                        // Fall through to settings / hostname.
+                        // Fall through to deviceAuthors / settings / hostname.
                     } else {
                         const raw = (await this.app.vault.adapter.read(overridePath)).trim();
                         if (raw.length > 0) return raw;
@@ -725,17 +766,17 @@ export default class EditHistory extends Plugin {
         } catch (e) {
             logWarn("Failed reading author override file", e);
         }
+        // Vault-shared per-device map wins over the single `authorName`
+        // setting because in a multi-device, multi-human vault the per-device
+        // mapping is the source of truth — `authorName` only ever applies
+        // when nobody added this device to the map.
+        const deviceAuthor = this.resolveDeviceAuthor();
+        if (deviceAuthor) return deviceAuthor;
         if (this.settings.authorName && this.settings.authorName.trim().length > 0) {
             return this.settings.authorName.trim();
         }
-        try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const os = require("os");
-            const host = os?.hostname?.();
-            if (host) return String(host);
-        } catch {
-            // Mobile has no node modules; fall through.
-        }
+        const host = this.getDeviceHostname();
+        if (host) return host;
         return "unknown";
     }
 
@@ -1386,20 +1427,17 @@ export default class EditHistory extends Plugin {
 
     /**
      * Resolve the author to tag on a UI edit. Skips the override file on
-     * purpose — overrides are for external processes.
+     * purpose — overrides are for external processes. Priority:
+     *   deviceAuthors[hostname] > settings.authorName > hostname > "unknown".
      */
     getUiAuthor(): string {
+        const deviceAuthor = this.resolveDeviceAuthor();
+        if (deviceAuthor) return deviceAuthor;
         if (this.settings.authorName && this.settings.authorName.trim().length > 0) {
             return this.settings.authorName.trim();
         }
-        try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const os = require("os");
-            const host = os?.hostname?.();
-            if (host) return String(host);
-        } catch {
-            // Mobile: no node modules.
-        }
+        const host = this.getDeviceHostname();
+        if (host) return host;
         return "unknown";
     }
 
@@ -2710,7 +2748,7 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
 
         new Setting(containerEl)
             .setName("Author name")
-            .setDesc(`Name tagged onto each new edit you make in the Obsidian editor. External processes (AI agents writing files directly) can override this by writing their name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear, or let it auto-expire via the timeout below). Saves triggered by you typing in Obsidian always use this Author name and ignore the override — agents can't hijack your manual edits. Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
+            .setDesc(`Vault-wide fallback name tagged onto new edits. Overridden per-device by the "Per-device authors" map below — set that map in a multi-device, multi-human vault. External processes (AI agents writing files directly) can override both by writing their name into '${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/${AUTHOR_OVERRIDE_FILE}' (delete the file to clear, or let it auto-expire via the timeout below). Saves triggered by you typing in Obsidian use the per-device map first, then this Author name, and ignore the override — agents can't hijack your manual edits. Empty here falls back to the device hostname. Old edits without an author will show "unknown".`)
             .addText(text => text
                 .setPlaceholder("e.g. Mark Volders")
                 .setValue(this.plugin.settings.authorName)
@@ -2736,7 +2774,7 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
         // whether a stale override file is hijacking their edits.
         const effectiveRow = new Setting(containerEl)
             .setName("Currently tagging edits as")
-            .setDesc("Resolved right now from: override file > Author name > device hostname.");
+            .setDesc("Resolved right now from: override file > per-device map > Author name > device hostname.");
         const effectiveText = effectiveRow.controlEl.createEl("code", { text: "…" });
         effectiveText.style.userSelect = "text";
         const refreshEffective = async () => {
@@ -2766,6 +2804,109 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                     new Notice("No override file to clear");
                 }
                 refreshEffective();
+            }));
+
+        containerEl.createEl("h3", {text: "Per-device authors"});
+
+        const deviceAuthorsDescEl = containerEl.createEl("div", {cls: "setting-item-description"});
+        deviceAuthorsDescEl.style.marginBottom = "0.75em";
+        deviceAuthorsDescEl.setText(
+            "Vault-shared map of device hostname \u2192 author name. When set, each " +
+            "device automatically tags new edits with the mapped author \u2014 no " +
+            "per-device setup needed beyond adding the row here. The map is " +
+            "stored in this plugin's data.json and synced with the vault, so " +
+            "adding e.g. 'Crest \u2192 Raf Peeters' on any machine takes effect on " +
+            "Crest immediately. Mobile devices have no hostname and fall back " +
+            "to the Author name above."
+        );
+
+        const thisHost = this.plugin.getDeviceHostname();
+        const thisHostRow = new Setting(containerEl)
+            .setName("This device's hostname")
+            .setDesc("Use this exact value as the key when mapping this device.");
+        const thisHostCode = thisHostRow.controlEl.createEl("code", {
+            text: thisHost || "(unavailable on this device)"
+        });
+        thisHostCode.style.userSelect = "text";
+
+        const mapRowsContainer = containerEl.createDiv();
+
+        const renderMapRows = () => {
+            mapRowsContainer.empty();
+            const map = this.plugin.settings.deviceAuthors || {};
+            const hosts = Object.keys(map).sort();
+            if (hosts.length === 0) {
+                const empty = mapRowsContainer.createEl("div", {cls: "setting-item-description"});
+                empty.style.fontStyle = "italic";
+                empty.style.padding = "0.25em 0 0.5em 0";
+                empty.setText("No mappings yet. Use the buttons below to add one.");
+                return;
+            }
+            for (const host of hosts) {
+                const row = new Setting(mapRowsContainer).setName(host);
+                row.addText(text => text
+                    .setPlaceholder("Author name for this device")
+                    .setValue(map[host])
+                    .onChange(async (value) => {
+                        this.plugin.settings.deviceAuthors[host] = value;
+                        await this.plugin.saveSettings();
+                        refreshEffective();
+                    }));
+                row.addExtraButton(btn => btn
+                    .setIcon("trash-2")
+                    .setTooltip("Remove this mapping")
+                    .onClick(async () => {
+                        delete this.plugin.settings.deviceAuthors[host];
+                        await this.plugin.saveSettings();
+                        refreshEffective();
+                        renderMapRows();
+                    }));
+            }
+        };
+        renderMapRows();
+
+        const addThisDeviceRow = new Setting(containerEl)
+            .setName("Add this device")
+            .setDesc(thisHost
+                ? `Adds a row keyed on '${thisHost}' (this device).`
+                : "Hostname unavailable \u2014 likely Obsidian Mobile. Add manually below.");
+        addThisDeviceRow.addButton(btn => btn
+            .setButtonText("Add")
+            .setCta()
+            .setDisabled(!thisHost)
+            .onClick(async () => {
+                if (thisHost && this.plugin.settings.deviceAuthors[thisHost] === undefined) {
+                    this.plugin.settings.deviceAuthors[thisHost] = "";
+                    await this.plugin.saveSettings();
+                    renderMapRows();
+                } else if (thisHost) {
+                    new Notice(`'${thisHost}' is already in the map`);
+                }
+            }));
+
+        let pendingHost = "";
+        const addOtherRow = new Setting(containerEl)
+            .setName("Add another device")
+            .setDesc("Type the hostname of a device you're not currently using.");
+        addOtherRow.addText(text => text
+            .setPlaceholder("hostname")
+            .onChange(value => { pendingHost = value.trim(); }));
+        addOtherRow.addButton(btn => btn
+            .setButtonText("Add")
+            .onClick(async () => {
+                if (!pendingHost) {
+                    new Notice("Type a hostname first");
+                    return;
+                }
+                if (this.plugin.settings.deviceAuthors[pendingHost] !== undefined) {
+                    new Notice(`'${pendingHost}' is already in the map`);
+                    return;
+                }
+                this.plugin.settings.deviceAuthors[pendingHost] = "";
+                await this.plugin.saveSettings();
+                pendingHost = "";
+                renderMapRows();
+                this.display();
             }));
 
         containerEl.createEl("h3", {text: "Appearance"});
